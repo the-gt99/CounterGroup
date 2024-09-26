@@ -1,10 +1,9 @@
 <?php
-
 class CounterGroup {
     private $baseUrl = 'https://my.cnord.net';
     private $email;
     private $password;
-    private $token;
+    private $cookies = [];
 
     public function __construct($email, $password) {
         $this->email = $email;
@@ -29,60 +28,65 @@ class CounterGroup {
         $response = $this->sendRequest($url, 'POST', $headers, $data);
 
         if ($response['http_code'] == 200) {
-            $this->extractToken($response['headers']);
-            return true;
+            $this->extractCookies($response['headers']);
+            return [
+                "isAuth" => true
+            ];
         }
 
-        return false;
-    }
-
-    public function getObjects($page = 1) {
-        if (!$this->token) {
-            throw new Exception('Не авторизован. Сначала выполните вход.');
-        }
-
-        $url = $this->baseUrl . '/object_manager/objects/' . $page;
-        $headers = [
-            'Cookie: object_manager="' . $this->token . '"'
+        return [
+            "isAuth" => false,
+            "err" => json_encode($response)
         ];
-
-        return $this->sendRequest($url, 'GET', $headers);
     }
 
     public function getAllPoints() {
-        if (!$this->token) {
+        if (empty($this->cookies)) {
             throw new Exception('Не авторизован. Сначала выполните вход.');
         }
 
-        $url = $this->baseUrl . '/object_manager/objects/1/info';
+        $url = $this->baseUrl . '/object_manager';
         $headers = [
             'Accept: */*',
             'Content-Type: application/x-www-form-urlencoded; charset=UTF-8',
-            'Cookie: object_manager="' . $this->token . '"',
+            'Cookie: ' . $this->getCookieHeader(),
             'Origin: ' . $this->baseUrl,
-            'Referer: ' . $this->baseUrl . '/object_manager/objects/1',
+            'Referer: ' . $this->baseUrl . '/object_manager',
             'X-Requested-With: XMLHttpRequest'
         ];
 
         $data = 'user_timezone_offset=240';
 
-        $response = $this->sendRequest($url, 'POST', $headers, $data);
-        return $this->parsePointInfo($response['body']);
+        $response = $this->sendRequest($url, 'GET', $headers, $data);
+        $objects = $this->parseObjectList($response['body']);
+        $thisObject = $this->parseObjectInputData($response['body']);
+        array_push($objects, $thisObject);
+
+        return $objects;
     }
 
     public function getPointEvents($pointId, $startDate, $endDate, $timezoneOffset = 240) {
-        if (!$this->token) {
+        if (empty($this->cookies)) {
             throw new Exception('Не авторизован. Сначала выполните вход.');
         }
-
         $url = $this->baseUrl . "/object_manager/objects/{$pointId}/arm_disarm_report/data";
+
         $headers = [
             'Accept: */*',
+            'Accept-Language: ru,ru-RU;q=0.9,en-US;q=0.8,en;q=0.7',
             'Content-Type: application/x-www-form-urlencoded; charset=UTF-8',
-            'Cookie: object_manager="' . $this->token . '"',
+            'Cookie: ' . $this->getCookieHeader(),
+            'DNT: 1',
             'Origin: ' . $this->baseUrl,
             'Referer: ' . $this->baseUrl . "/object_manager/objects/{$pointId}",
-            'X-Requested-With: XMLHttpRequest'
+            'Sec-Fetch-Dest: empty',
+            'Sec-Fetch-Mode: cors',
+            'Sec-Fetch-Site: same-origin',
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            'X-Requested-With: XMLHttpRequest',
+            'sec-ch-ua: "Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+            'sec-ch-ua-mobile: ?0',
+            'sec-ch-ua-platform: "Windows"'
         ];
 
         $data = http_build_query([
@@ -92,6 +96,11 @@ class CounterGroup {
         ]);
 
         $response = $this->sendRequest($url, 'POST', $headers, $data);
+
+        if ($response['http_code'] == 400) {
+            throw new Exception('Ошибка 400: Неверный запрос. Проверьте параметры. Тело ответа: ' . $response['body']);
+        }
+
         return $this->parsePointEvents($response['body']);
     }
 
@@ -102,6 +111,9 @@ class CounterGroup {
         curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         curl_setopt($ch, CURLOPT_HEADER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
 
         if ($data) {
             curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
@@ -119,43 +131,59 @@ class CounterGroup {
         ];
     }
 
-    private function extractToken($headers) {
-        if (preg_match('/object_manager="([^"]+)"/', $headers, $matches)) {
-            $this->token = $matches[1];
+    private function extractCookies($headers) {
+        preg_match_all('/^Set-Cookie:\s*([^;]*)/mi', $headers, $matches);
+        foreach($matches[1] as $item) {
+            parse_str($item, $cookie);
+            $this->cookies = array_merge($this->cookies, $cookie);
         }
     }
 
-    private function parsePointInfo($html) {
-        $info = [];
-        $pattern = '/<tr>\s*<th>(.*?)<\/th>\s*<td>(.*?)<\/td>\s*<\/tr>/s';
+    private function getCookieHeader() {
+        $cookieStrings = [];
+        foreach ($this->cookies as $name => $value) {
+            $cookieStrings[] = $name . '=' . $value;
+        }
+        return implode('; ', $cookieStrings);
+    }
+
+    private function parseObjectList($html) {
+        $objects = [];
+
+        $pattern = '/<li><a href="\/object_manager\/objects\/(\d+)">(.*?)<\/a><\/li>/';
+
         preg_match_all($pattern, $html, $matches, PREG_SET_ORDER);
 
         foreach ($matches as $match) {
-            $key = trim(strip_tags($match[1]));
-            $value = trim(strip_tags($match[2]));
+            $objects[] = [
+                'objId' => intval($match[1]),
+                'name' => html_entity_decode(trim($match[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8')
+            ];
+        }
 
-            if($key == "Объект")
-            {
-                $info['objFullName'] = $value;
-                preg_match_all('/№ (\d{1,}), (.*?)$/m', $value, $objInf);
-                $info['objId'] = $objInf[1][0];
-                $info['objName'] = $objInf[2][0];
+        return $objects;
+    }
+
+    private function parseObjectInputData($html) {
+        $result = [
+            'objId' => null,
+            'name' => ''
+        ];
+
+        $pattern = '/<input[^>]*id="edit-object-name-input"[^>]*>/';
+        if (preg_match($pattern, $html, $matches)) {
+            $input_html = $matches[0];
+
+            if (preg_match('/data-object-name="([^"]*)"/', $input_html, $name_matches)) {
+                $result['name'] = html_entity_decode($name_matches[1], ENT_QUOTES | ENT_HTML5, 'UTF-8');
             }
-            else if($key == "Адрес")
-            {
-                $info['address'] = $value;
-            }
-            else if($key ==  "Сигнализация")
-            {
-                $info['signaling'] = $value;
-            }
-            else
-            {
-                $info['anyInf'][$key] = $value;
+
+            if (preg_match('/data-save-url="\/object_manager\/objects\/(\d+)\/save_custom_object_name"/', $input_html, $id_matches)) {
+                $result['objId'] = intval($id_matches[1]);
             }
         }
 
-        return $info;
+        return $result;
     }
 
     private function parsePointEvents($html) {
@@ -164,7 +192,7 @@ class CounterGroup {
         preg_match_all($pattern, $html, $matches, PREG_SET_ORDER);
 
         $currentDate = null;
-        $currentYear = date('Y'); // Текущий год, так как в данных он не указан
+        $currentYear = date('Y');
 
         foreach ($matches as $match) {
             $date = trim(strip_tags($match[1]));
@@ -178,15 +206,32 @@ class CounterGroup {
             }
 
             if ($currentDate && $time !== '—' && $event !== '—' && $this->validateTime($time)) {
-                // Преобразование даты и времени в Unix timestamp
                 $dateTime = $this->convertToUnixTime($currentDate, $time, $currentYear);
 
-                if(!$dateTime)
+                if (!$dateTime) {
                     $dateTime = $currentDate;
+                }
 
                 if ($dateTime !== false) {
                     if (!isset($events[$dateTime])) {
                         $events[$dateTime] = [];
+                    }
+
+                    $status = $eventClass;
+
+                    switch($eventClass)
+                    {
+                        case "arm":
+                            $status = "closed";
+                            break;
+
+                        case "disarming":
+                            $status = "opened";
+                            break;
+
+                        case "alarm":
+                            $status = "warning";
+                            break;
                     }
 
                     $events[$dateTime][] = [
@@ -194,32 +239,28 @@ class CounterGroup {
                         'time' => $time,
                         'event' => $event,
                         'event_class' => $eventClass,
+                        'status' => $status,
                         'details' => $details
                     ];
                 }
             }
         }
 
-        // Сортировка событий по Unix timestamp (ключу массива)
-        //ksort($events);
-
+        krsort($events);
         return $events;
     }
 
     private function convertToUnixTime($date, $time, $year) {
-        // Проверка на пустые значения
         if (empty($date) || $date == '—' || empty($time) || $time == '—' || !$this->validateTime($time)) {
             return false;
         }
 
         $pattern = '/(\d+)\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря),\s+(пн|вт|ср|чт|пт|сб|вс)/u';
 
-
         if (preg_match($pattern, $date, $matches)) {
             $day = $matches[1];
             $month = $matches[2];
 
-            // Преобразование названия месяца в числовой формат
             $months = [
                 'января' => 1, 'февраля' => 2, 'марта' => 3, 'апреля' => 4,
                 'мая' => 5, 'июня' => 6, 'июля' => 7, 'августа' => 8,
@@ -227,10 +268,8 @@ class CounterGroup {
             ];
             $monthNum = $months[$month];
 
-            // Формирование полной строки даты и времени
-            $dateTimeString = sprintf('%d-%s-%s %s:00', $year, $monthNum, $day, $time);
+            $dateTimeString = sprintf('%d-%02d-%02d %s:00', $year, $monthNum, $day, $time);
 
-            // Создание объекта DateTime с учетом часового пояса Саратова (UTC+4)
             try {
                 $dateTime = new DateTime($dateTimeString, new DateTimeZone('Europe/Saratov'));
                 return $dateTime->getTimestamp();
@@ -247,3 +286,7 @@ class CounterGroup {
         return preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', $time) === 1;
     }
 }
+
+
+
+
